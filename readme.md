@@ -3,4 +3,4 @@
 version_0.1: Applying Transformer in GAN. 
 - Loss Function  
   - Discriminator Loss: $L_{d} = CELoss(\hat{y}, y)$
-  - Restructure Loss: $L_{r}= CELoss(\widehat{y}, \widetilde{y}$
+  - Restructure Loss: $L_{r}= CELoss(\widehat{y}, \widetilde{y})$
