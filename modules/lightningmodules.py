@@ -66,14 +66,14 @@ class Encoder_Decoder(nn.Module):
         self.embedding_module = EmbeddingWithPosition(vocab_size, embedding_dim, max_len)
         self.generate_square_subsequent_mask = nn.Transformer.generate_square_subsequent_mask(max_len).cuda()
         # print(self.generate_square_subsequent_mask)
-        self.norm = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.LayerNorm(dim_feedforward),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Softmax(dim=-1)
-        )
+        # self.norm = nn.Sequential(
+        #     nn.Linear(d_model, dim_feedforward),
+        #     nn.LayerNorm(dim_feedforward),
+        #     nn.ReLU(inplace=True),
+        #     nn.Dropout(0.5),
+        #     nn.Linear(dim_feedforward, d_model),
+        #     nn.Softmax(dim=-1)
+        # )
 
     def forward(self, tensor_src, tensor_tgt):
         # encoder forward
@@ -164,13 +164,13 @@ class CAATModule(LightningModule):
            get src class distribution. 
            cls_src [B, D]
         """
-        cls_src = self.discriminator(src_latent_copy.sum(1))
-        # cls_src = self.discriminator(src_latent.sum(1))
+        cls_src = self.discriminator(src_latent_copy.mean(1))
+        # cls_src = self.discriminator(src_latent.mean(1))
         """
            get tgt class distribution 
            cls_tgt [B, D]
         """
-        cls_tgt = self.discriminator(tgt_latent_copy.sum(1))
+        cls_tgt = self.discriminator(tgt_latent_copy.mean(1))
         # cls_tgt = self.discriminator(tgt_latent.sum(1))
         """
             reverse sentence label 0->1, 1->0
@@ -227,7 +227,7 @@ class CAATModule(LightningModule):
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         optimizer_generator, optimizer_discriminator = self.optimizers()
         discriminator_loss, restructure_loss, src_class, \
-            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx)
+            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx, True)
 
         """ 
             generator backward
