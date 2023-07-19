@@ -1,5 +1,18 @@
 # A lightning model for Author Rewriting  
-## UPDATE 2023/7/19
+## UPDATE 2023/7/19 22:22
+version_0.2: Applying Transformer in GAN.  
+<font face="Lumanosimo">* **Changes**</font>  
+- Put GRU layer after the last Encoder layer.
+- The Cosine Positional Embedding Table in Transformer\[google2017\] was used.
+- The restructure loss in CAAT \[Peking University- X L Wan -2019\] was used.
+- Parameters init method xavier uniform was used.
+- method covert_latent_to_vocab_probability_distribution() changed F.softmax() to F.log_softmax()
+- SGD optimizer was applied in generator with $lr=0.1$, and AdamW optimizer was applied in discriminator with $lr=0.1$.  
+<font face="Lumanosimo" size=5 >_It worked!_</font> 
+- \color{red}{Some thing was still wrong.}  
+  (1) loss of discriminator didn't decrease. 
+
+## UPDATE 2023/7/19 15:03
 version_0.1: Applying Transformer in GAN. 
 - Loss Function  
   - Discriminator Loss: $L_{d} = CELoss(\hat{y}, y)$
@@ -13,7 +26,7 @@ version_0.1: Applying Transformer in GAN.
 - \color{green}{Possible solutions}
   - remove the Fully-Connected layer &#x2716;
     - Reason: We haven't used Fully-Connected layer after last Decoder layer. 
-  - use mean operation alternative the sum
+  - use mean operation alternative the sum &#x2716
     - Here, situations need to be discussed.  
       (1) For Sequence classification Task, the mean operation may not influence.
       (2) As for Word Prediction Task, the mean operation do influence the result.

@@ -28,12 +28,37 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
     def forward(self, x: Tensor) -> Tensor:
-        x + self.pe[: x.size(0), :]  # type: ignore[index]
+        x + self.pe[: x.size(0), :, :]  # type: ignore[index]
         return self.dropout(x)
+
+
+class RestructureLoss(nn.Module):
+    def __init__(self, size, padding_idx, smoothing=0.0):
+        super(RestructureLoss, self).__init__()
+        self.criterion = nn.KLDivLoss(size_average=False)
+        self.padding_idx = padding_idx
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.size = size
+        self.true_dist = None
+
+    def forward(self, x, target):
+        assert x.size(1) == self.size
+        true_dist = x.data.clone()
+        true_dist.fill_(self.smoothing / (self.size - 2))
+        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        true_dist[:, self.padding_idx] = 0
+        mask = torch.nonzero(target.data == self.padding_idx)
+        if mask.dim() > 0:
+            true_dist.index_fill_(0, mask.squeeze(), 0.0)
+        self.true_dist = true_dist
+        return self.criterion(x, Variable(true_dist, requires_grad=False))
+
+
 
 class EmbeddingWithPosition(nn.Module):
     def __init__(self, vocab_size, embedding_dim, max_len):
@@ -60,6 +85,7 @@ class Encoder_Decoder(nn.Module):
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, activation=F.gelu), num_layers
         )
+        self.gru = nn.GRU(input_size=embedding_dim, hidden_size=embedding_dim, num_layers=1, batch_first=True)
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, batch_first=True), num_layers
         )
@@ -74,6 +100,7 @@ class Encoder_Decoder(nn.Module):
         #     nn.Linear(dim_feedforward, d_model),
         #     nn.Softmax(dim=-1)
         # )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, tensor_src, tensor_tgt):
         # encoder forward
@@ -81,9 +108,12 @@ class Encoder_Decoder(nn.Module):
         # print(tensor_src, self.pad_id)
         src_key_padding_mask = get_key_padding_mask(tensor_src, self.pad_id)
         src_latent = self.encoder(src_embeddings, src_key_padding_mask=src_key_padding_mask)
+        src_latent, _ = self.gru(self.embedding_module.positional_embedding(src_latent))
+        src_latent = F.sigmoid(src_latent)
         # decoder forward
         tgt_embeddings = self.embedding_module(tensor_tgt)
         tgt_key_padding_mask = get_key_padding_mask(tensor_tgt, self.pad_id)
+        # print(tgt_embeddings.shape, src_latent.shape)
         tgt_latent = self.decoder(tgt_embeddings, src_latent,
                                             tgt_mask=self.generate_square_subsequent_mask.bool(),
                                             memory_key_padding_mask=src_key_padding_mask,
@@ -135,7 +165,7 @@ class CAATModule(LightningModule):
         # define loss functions
         self.classification_loss = nn.CrossEntropyLoss()
         self.src_tgt_unsimilarity_loss = nn.CosineSimilarity(dim=-1)
-        self.restruct_loss = nn.CrossEntropyLoss(reduction="mean", label_smoothing=0.5)
+        self.restruct_loss = RestructureLoss(vocab_size, self.tokenizer.pad_token_id, 0.1)
         # init more lightning hyperparameter
         self.automatic_optimization = False
         self.save_hyperparameters()
@@ -146,6 +176,10 @@ class CAATModule(LightningModule):
         # define temporary variable
         self.training_step_outputs = {"gen_loss": [], "dis_loss": []}
         self.validation_step_outpus = {"gen_loss": [], "dis_loss": []}
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     def share_step(self, batch, batch_idx, greek_decode=False):
         tensor_src, tensor_src_mask, tensor_tgt, tensor_tgt_mask, tensor_labels = batch
@@ -164,7 +198,7 @@ class CAATModule(LightningModule):
            get src class distribution. 
            cls_src [B, D]
         """
-        cls_src = self.discriminator(src_latent_copy.mean(1))
+        cls_src = self.discriminator(src_latent_copy.sum(1))
         # cls_src = self.discriminator(src_latent.mean(1))
         """
            get tgt class distribution 
@@ -179,8 +213,8 @@ class CAATModule(LightningModule):
 
         """compute classification loss """
         src_cls_loss = self.compute_classification_loss(cls_src, tensor_labels.long())
-        tgt_cls_loss = self.compute_classification_loss(cls_tgt, reverse_tensor_label.long())
-        discriminator_loss = tgt_cls_loss
+        # tgt_cls_loss = self.compute_classification_loss(cls_tgt, reverse_tensor_label.long())
+        discriminator_loss = src_cls_loss
 
         """convert tgt_latent to id probability distribution.
            tgt_latent [B, L, D]
@@ -192,7 +226,9 @@ class CAATModule(LightningModule):
         """
             compute restructure loss
         """
-        restructure_loss = self.compute_restruct_loss(tgt_word_probability_distribution, tensor_tgt_y, tensor_src_mask)
+        # print(tgt_word_probability_distribution[0], tensor_tgt_y[0])
+        restructure_loss = self.compute_restruct_loss(tgt_word_probability_distribution.contiguous().view(-1, tgt_word_probability_distribution.size(-1)),
+                                    tensor_tgt_y.contiguous().view(-1), tensor_src_mask)
         """
             compute class index both of src and tgt
             src_class [B, C]
@@ -211,7 +247,7 @@ class CAATModule(LightningModule):
 
     def covert_latent_to_vocab_probability_distribution(self, input_tensor):
         vocab_tensor = self.generate_linear(input_tensor)
-        log_softmax = F.softmax(vocab_tensor, dim=-1)
+        log_softmax = F.log_softmax(vocab_tensor, dim=-1)
         return log_softmax
 
     def compute_classification_loss(self, logit, tensor_labels):
@@ -222,12 +258,12 @@ class CAATModule(LightningModule):
 
     def compute_restruct_loss(self, generate_tensor, tensor_tgt_y, tensor_src_mask):
         return self.restruct_loss(generate_tensor.contiguous().view(-1, generate_tensor.size(-1)),
-                                  tensor_tgt_y.long().contiguous().view(-1))/tensor_src_mask.sum()
+                                  tensor_tgt_y.long().contiguous().view(-1))/(tensor_src_mask.sum()+1e-9)
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         optimizer_generator, optimizer_discriminator = self.optimizers()
         discriminator_loss, restructure_loss, src_class, \
-            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx, True)
+            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx)
 
         """ 
             generator backward
@@ -271,11 +307,6 @@ class CAATModule(LightningModule):
         self.training_step_outputs["gen_loss"] = []
         self.training_step_outputs["dis_loss"] = []
 
-    def configure_optimizers(self):
-        opt_g = torch.optim.Adam(self.generator.parameters(), lr=0.001, betas=(self.hparams.b1, self.hparams.b2))
-        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=0.0001, betas=(self.hparams.b1, self.hparams.b2))
-        return [opt_g, opt_d]
-
     def greek_decode(self, input_tensor):
         output_max_indices = torch.argmax(input_tensor, dim=-1)
         text = self.tokenizer.batch_decode(output_max_indices)
@@ -303,3 +334,9 @@ class CAATModule(LightningModule):
         self.log("val_dis_loss", metrics[1], prog_bar=True, on_epoch=True)
         self.validation_step_outpus["gen_loss"] = []
         self.validation_step_outpus["dis_loss"] = []
+
+
+    def configure_optimizers(self):
+        opt_g = torch.optim.SGD(self.generator.parameters(), lr=0.001)
+        opt_d = torch.optim.AdamW(self.discriminator.parameters(), lr=0.001, betas=(self.hparams.b1, self.hparams.b2))
+        return [opt_g, opt_d]

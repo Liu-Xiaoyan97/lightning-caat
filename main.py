@@ -22,9 +22,9 @@ if __name__=="__main__":
     trainer = Trainer(
         callbacks=[
             lightning.pytorch.callbacks.ModelCheckpoint(
-                monitor="val_dis_loss",
+                monitor="val_gen_loss",
                 save_top_k=2,
-                filename='{epoch}-{val_gen_loss:.2f}-{val_dis_loss:.2f}',
+                filename='{epoch}-{val_gen_loss:.3f}-{val_dis_loss:.4f}',
                 mode='min'
             )
         ],

@@ -79,10 +79,13 @@ class ToutiaoDataset(Dataset):
 
     def convert_str_to_id(self, field):
         text = field["text"]
-        input = self.tokenizer(text, text_target=text[1:], padding=self.padding, truncation=self.truncation,
-                               max_length=self.max_len)
-        label_attention_mask = input["attention_mask"][1:]
-        label_attention_mask.append(0)
+        input = self.tokenizer(text, text_target=text, padding=self.padding, truncation=self.truncation,
+                               max_length=self.max_len, add_special_tokens=False)
+        # print(self.tokenizer.sep_token_id)
+        input["labels"].insert(0, self.tokenizer.sep_token_id)
+        input["labels"] = input["labels"][:-1]
+        label_attention_mask = [1]
+        label_attention_mask.extend(input["attention_mask"][: 1])
         input["tgt_attention_mask"] = label_attention_mask
         return input
 
