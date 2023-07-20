@@ -1,4 +1,10 @@
 # A lightning model for Author Rewriting  
+
+## UPDATE 2023/7/20/ 10:00  
+version_0.2.1: Applying Transformer in GAN.  
+<font face="Lumanosimo">* **Changes**</font>  
+In this version, we applied LR_Scheduler in optimizers.  
+Then, we increased num_worker from 1 to 16, batch_size was also increased to 512.   
 ## UPDATE 2023/7/19 22:22
 version_0.2: Applying Transformer in GAN.  
 <font face="Lumanosimo">* **Changes**</font>  

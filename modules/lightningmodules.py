@@ -262,6 +262,7 @@ class CAATModule(LightningModule):
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         optimizer_generator, optimizer_discriminator = self.optimizers()
+        schg, schd = self.lr_schedulers()
         discriminator_loss, restructure_loss, src_class, \
             tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx)
 
@@ -272,6 +273,7 @@ class CAATModule(LightningModule):
         self.toggle_optimizer(optimizer_generator)
         self.manual_backward(restructure_loss)
         optimizer_generator.step()
+        schg.step()
         optimizer_generator.zero_grad()
         # for param in self.generator.decoder.parameters():
         #     print(param[0])
@@ -284,6 +286,7 @@ class CAATModule(LightningModule):
         self.toggle_optimizer(optimizer_discriminator)
         self.manual_backward(discriminator_loss)
         optimizer_discriminator.step()
+        schd.step()
         optimizer_discriminator.zero_grad()
         self.untoggle_optimizer(optimizer_discriminator)
         """
@@ -337,6 +340,9 @@ class CAATModule(LightningModule):
 
 
     def configure_optimizers(self):
-        opt_g = torch.optim.SGD(self.generator.parameters(), lr=0.001)
-        opt_d = torch.optim.AdamW(self.discriminator.parameters(), lr=0.001, betas=(self.hparams.b1, self.hparams.b2))
-        return [opt_g, opt_d]
+        opt_g = torch.optim.SGD(self.generator.parameters(), lr=0.1)
+        opt_d = torch.optim.AdamW(self.discriminator.parameters(), lr=0.1, betas=(self.hparams.b1, self.hparams.b2))
+        lr_scheduler_g = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_g, T_0=100, T_mult=2)
+        lr_scheduler_d = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_g, T_0=50, T_mult=2)
+        # lr_scheduler_d = torch.optim.lr_scheduler.OneCycleLR(opt_d, max_lr=0.1, epochs=1000)
+        return [opt_g, opt_d], [lr_scheduler_g, lr_scheduler_d]

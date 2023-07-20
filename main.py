@@ -24,7 +24,7 @@ if __name__=="__main__":
             lightning.pytorch.callbacks.ModelCheckpoint(
                 monitor="val_gen_loss",
                 save_top_k=2,
-                filename='{epoch}-{val_gen_loss:.3f}-{val_dis_loss:.4f}',
+                filename='{epoch}-{val_gen_loss:.4f}-{val_dis_loss:.4f}',
                 mode='min'
             )
         ],
