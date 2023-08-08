@@ -1,4 +1,8 @@
 # A lightning model for Author Rewriting  
+## UPDATE 2023/8/8/  
+version_0.3: GPT Style PTM available.  
+In this version, we adopt GPT Style PTM task for text generation which could be represented as follows:  
+$$max L = p(x_t|x_{i<t}$$
 
 ## UPDATE 2023/7/20/ 10:00  
 version_0.2.1: Applying Transformer in GAN.  
