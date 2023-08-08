@@ -10,12 +10,10 @@ import math
 import torch
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 from lightning import LightningModule
-from tokenizers import tokenizers
 from torch import nn, Tensor
-import torch.nn.functional as F
-from torch.autograd import Variable
-from torchmetrics import Accuracy
-from transformers import PreTrainedTokenizer, AutoTokenizer
+from torchmetrics import BLEUScore
+from transformers import AutoTokenizer
+from modules.MHBAMixer import MHBAMixer
 
 
 class PositionalEncoding(nn.Module):
@@ -36,32 +34,8 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class RestructureLoss(nn.Module):
-    def __init__(self, size, padding_idx, smoothing=0.0):
-        super(RestructureLoss, self).__init__()
-        self.criterion = nn.KLDivLoss(size_average=False)
-        self.padding_idx = padding_idx
-        self.confidence = 1.0 - smoothing
-        self.smoothing = smoothing
-        self.size = size
-        self.true_dist = None
-
-    def forward(self, x, target):
-        assert x.size(1) == self.size
-        true_dist = x.data.clone()
-        true_dist.fill_(self.smoothing / (self.size - 2))
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        true_dist[:, self.padding_idx] = 0
-        mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
-        self.true_dist = true_dist
-        return self.criterion(x, Variable(true_dist, requires_grad=False))
-
-
-
 class EmbeddingWithPosition(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, max_len):
+    def __init__(self, vocab_size, embedding_dim, max_len, max_batch_size):
         super().__init__()
         self.word_embedding = nn.Embedding(vocab_size, embedding_dim)
         self.positional_embedding = PositionalEncoding(embedding_dim, 0.1, max_len)
@@ -78,271 +52,164 @@ def get_key_padding_mask(tokens, pad_id):
     return key_padding_mask.cuda()
 
 
-class Encoder_Decoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, max_len, d_model, nhead, dim_feedforward, num_layers, pad_id):
+class BackBoneModule(nn.Module):
+    def __init__(self, vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob, num_mixers):
         super().__init__()
-        self.pad_id = pad_id
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, activation=F.gelu), num_layers
+        self.dropout = nn.Dropout(p=0.1)
+        # n_heads, hidden_dim: int, kernel_size: int, padding: int, prob: float, num_mixers
+        self.backbone = MHBAMixer(n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob,  num_mixers)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(embedding_dim),
+            nn.Linear(embedding_dim, vocab_size),
+            nn.LayerNorm(vocab_size),
+            nn.Softmax(dim=-1)
         )
-        self.gru = nn.GRU(input_size=embedding_dim, hidden_size=embedding_dim, num_layers=1, batch_first=True)
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, batch_first=True), num_layers
-        )
-        self.embedding_module = EmbeddingWithPosition(vocab_size, embedding_dim, max_len)
-        self.generate_square_subsequent_mask = nn.Transformer.generate_square_subsequent_mask(max_len).cuda()
-        # print(self.generate_square_subsequent_mask)
-        # self.norm = nn.Sequential(
-        #     nn.Linear(d_model, dim_feedforward),
-        #     nn.LayerNorm(dim_feedforward),
-        #     nn.ReLU(inplace=True),
-        #     nn.Dropout(0.5),
-        #     nn.Linear(dim_feedforward, d_model),
-        #     nn.Softmax(dim=-1)
-        # )
-        self.sigmoid = nn.Sigmoid()
+        self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, tensor_src, tensor_tgt):
-        # encoder forward
-        src_embeddings = self.embedding_module(tensor_src)
-        # print(tensor_src, self.pad_id)
-        src_key_padding_mask = get_key_padding_mask(tensor_src, self.pad_id)
-        src_latent = self.encoder(src_embeddings, src_key_padding_mask=src_key_padding_mask)
-        src_latent, _ = self.gru(self.embedding_module.positional_embedding(src_latent))
-        src_latent = F.sigmoid(src_latent)
-        # decoder forward
-        tgt_embeddings = self.embedding_module(tensor_tgt)
-        tgt_key_padding_mask = get_key_padding_mask(tensor_tgt, self.pad_id)
-        # print(tgt_embeddings.shape, src_latent.shape)
-        tgt_latent = self.decoder(tgt_embeddings, src_latent,
-                                            tgt_mask=self.generate_square_subsequent_mask.bool(),
-                                            memory_key_padding_mask=src_key_padding_mask,
-                                            tgt_key_padding_mask=tgt_key_padding_mask)
-        return src_latent, tgt_latent
+    @staticmethod
+    def greek_decoder(token_logit):
+        token_idx = torch.argmax(token_logit, dim=-1)
+        return token_idx
+
+    def forward(self, inputs, target, padding_mask, causal_mask, embedding):
+        feature_embedding = embedding(inputs)
+        last_token_feature = self.backbone(feature_embedding, padding_mask, causal_mask)[:, -1]
+        last_token_logit = self.classifier(last_token_feature)
+        # print(last_token_logit.dtype, )
+        most_prob_idx = self.greek_decoder(last_token_logit)
+        loss = self.criterion(last_token_logit, target.long())
+        return last_token_logit, most_prob_idx, loss
 
 
-def covert_distribution_to_max_index(inputs):
-    return torch.argmax(inputs, dim=-1)
-
-
-def compute_accuracy(inputs, target):
-    return torch.eq(inputs, target).float().mean()
-
-
-def merge_metrics(logdict):
-    n_steps = len(logdict["gen_loss"])+1e-9
-    return sum(logdict["gen_loss"])/n_steps,\
-            sum(logdict['dis_loss'])/n_steps
-
-class CAATModule(LightningModule):
+class GenerateModule(LightningModule):
     def __init__(self,
                  vocab_size: int=21128,
                  embedding_dim: int=64,
-                 d_model: int=64,
-                 nhead: int=4,
+                 n_heads: int=4,
                  max_len: int=64,
-                 dim_feedforward: int=128,
+                 hidden_dim: int=128,
+                 kernel_size = [ 5, 3, 3, 3, 3, 3, 3, 7 ],
+                 padding = [2, 1, 1, 1, 1, 1, 1, 3],
                  lr: float=0.001,
                  b1: float=0.999,
                  b2: float=0.9,
                  num_layers: int=2,
-                 num_class: int=2
+                 prob: float=0.8,
+                 batch_size: int=64
                  ):
         super().__init__()
         # define tokenizer convert ids to words
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese')
+        self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
         # init generator module
-        self.generator = Encoder_Decoder(vocab_size, embedding_dim, max_len, d_model,
-                                                    nhead, dim_feedforward, num_layers,
-                                         self.tokenizer.pad_token_id)
+        self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob, num_layers)
         # init discriminator
-        self.discriminator = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Linear(dim_feedforward, num_class),
-            nn.Sigmoid()
-        )
-        # define loss functions
         self.classification_loss = nn.CrossEntropyLoss()
-        self.src_tgt_unsimilarity_loss = nn.CosineSimilarity(dim=-1)
-        self.restruct_loss = RestructureLoss(vocab_size, self.tokenizer.pad_token_id, 0.1)
-        # init more lightning hyperparameter
-        self.automatic_optimization = False
         self.save_hyperparameters()
-
-        # init generate weight covert latent to vocab probability
-        self.generate_linear = nn.Linear(d_model, vocab_size)
-
         # define temporary variable
-        self.training_step_outputs = {"gen_loss": [], "dis_loss": []}
-        self.validation_step_outpus = {"gen_loss": [], "dis_loss": []}
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        self.test_step_outpus = []
+        self.automatic_optimization = False
+        self.blue = BLEUScore(smooth=True)
+        self.causal_mask = torch.tril(torch.ones(max_len, max_len), diagonal=0).bool().cuda()
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def share_step(self, batch, batch_idx, greek_decode=False):
-        tensor_src, tensor_src_mask, tensor_tgt, tensor_tgt_mask, tensor_labels = batch
-        tensor_tgt_y = tensor_src
-        """
-           get src and tgt latent representation. 
-           src_latent src_latent [B, L, D] 
-           B: batch size, L: hyperparameter max_len -> maximum sequence length, 
-           D: hyperparameter d_model ->embedding dimensions
-        """
-        src_latent, tgt_latent = self.generator(tensor_src, tensor_tgt)
-        if greek_decode:
-            self.greek_decode(src_latent)
-        src_latent_copy, tgt_latent_copy = src_latent.detach(), tgt_latent.detach()
-        """
-           get src class distribution. 
-           cls_src [B, D]
-        """
-        cls_src = self.discriminator(src_latent_copy.sum(1))
-        # cls_src = self.discriminator(src_latent.mean(1))
-        """
-           get tgt class distribution 
-           cls_tgt [B, D]
-        """
-        cls_tgt = self.discriminator(tgt_latent_copy.mean(1))
-        # cls_tgt = self.discriminator(tgt_latent.sum(1))
-        """
-            reverse sentence label 0->1, 1->0
-        """
-        reverse_tensor_label = ~tensor_labels.bool()
+    @staticmethod
+    def compute_metrics(metrics):
+        batch_len = len(metrics)
+        average_loss = 0.
+        average_blue = 0.
+        for iter in metrics:
+            average_loss += iter[0]
+            average_blue += iter[1]
+        return average_loss/batch_len, average_blue/batch_len
 
-        """compute classification loss """
-        src_cls_loss = self.compute_classification_loss(cls_src, tensor_labels.long())
-        # tgt_cls_loss = self.compute_classification_loss(cls_tgt, reverse_tensor_label.long())
-        discriminator_loss = src_cls_loss
+    def covert_tokens_to_sentences(self, tokens):
+        sentences = self.tokenizer.batch_decode(tokens.long(), skip_special_tokens=True)
+        return sentences
 
-        """convert tgt_latent to id probability distribution.
-           tgt_latent [B, L, D]
-           tgt_word_probability [B, L, W]
-           W: hyperparameter vocab_size -> vocabulary size
-        """
-        tgt_word_probability_distribution = self.covert_latent_to_vocab_probability_distribution(tgt_latent)
-
-        """
-            compute restructure loss
-        """
-        # print(tgt_word_probability_distribution[0], tensor_tgt_y[0])
-        restructure_loss = self.compute_restruct_loss(tgt_word_probability_distribution.contiguous().view(-1, tgt_word_probability_distribution.size(-1)),
-                                    tensor_tgt_y.contiguous().view(-1), tensor_src_mask)
-        """
-            compute class index both of src and tgt
-            src_class [B, C]
-            tgt_class [B, C]
-            C: hyperparameter num_classes -> number of classes
-        """
-        src_class = covert_distribution_to_max_index(cls_src)
-        tgt_class = covert_distribution_to_max_index(cls_tgt)
-
-        """
-            greek decode
-        """
-        if greek_decode:
-            self.greek_decode(tgt_word_probability_distribution)
-        return discriminator_loss, restructure_loss, src_class, tgt_class, tensor_labels, reverse_tensor_label
-
-    def covert_latent_to_vocab_probability_distribution(self, input_tensor):
-        vocab_tensor = self.generate_linear(input_tensor)
-        log_softmax = F.log_softmax(vocab_tensor, dim=-1)
-        return log_softmax
-
-    def compute_classification_loss(self, logit, tensor_labels):
-        return self.classification_loss(logit, tensor_labels.long())
-
-    def compute_triplet_loss(self, positive, negitive, truth):
-        return self.triplet_loss(positive, negitive, truth)
-
-    def compute_restruct_loss(self, generate_tensor, tensor_tgt_y, tensor_src_mask):
-        return self.restruct_loss(generate_tensor.contiguous().view(-1, generate_tensor.size(-1)),
-                                  tensor_tgt_y.long().contiguous().view(-1))/(tensor_src_mask.sum()+1e-9)
+    def share_step(self, batch):
+        src, target, token_type_ids, attention_mask = batch
+        memory = torch.empty(target.size(0), 0).long().cuda()
+        total_loss = 0.
+        for len in range(self.hparams.max_len):
+            output, idx, loss = self.model(
+                src, target[:, len], attention_mask, self.causal_mask[len][: src.size(1)], self.embedding)
+            memory = torch.cat((memory, idx[:, None]), dim=1)
+            total_loss += loss
+        return memory, total_loss
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        optimizer_generator, optimizer_discriminator = self.optimizers()
-        schg, schd = self.lr_schedulers()
-        discriminator_loss, restructure_loss, src_class, \
-            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx)
-
-        """ 
-            generator backward
-        """
-        # print(f"batch {batch_idx} before backward-->", src_latent.grad_fn, tgt_latent.grad_fn)
-        self.toggle_optimizer(optimizer_generator)
-        self.manual_backward(restructure_loss)
-        optimizer_generator.step()
-        schg.step()
-        optimizer_generator.zero_grad()
-        # for param in self.generator.decoder.parameters():
-        #     print(param[0])
-        #     break
-        self.untoggle_optimizer(optimizer_generator)
-        # print(f"batch {batch_idx} after backward-->", src_latent.grad_fn, tgt_latent.grad_fn)
-        """
-            discriminator backward
-        """
-        self.toggle_optimizer(optimizer_discriminator)
-        self.manual_backward(discriminator_loss)
-        optimizer_discriminator.step()
-        schd.step()
-        optimizer_discriminator.zero_grad()
-        self.untoggle_optimizer(optimizer_discriminator)
-        """
-            compute and log metrics records
-        """
-        self.log("discriminator_loss", discriminator_loss, prog_bar=True)
-        self.log("res_loss", restructure_loss, prog_bar=True)
-        accuracy = compute_accuracy(src_class, src_label)
-        # self.log("src_cls_acc", accuracy, prog_bar=True)
-        accuracy = compute_accuracy(tgt_class, tgt_label)
-        # self.log("tgt_cls_acc", accuracy, prog_bar=True)
-        total_loss = discriminator_loss+restructure_loss
-        self.training_step_outputs["gen_loss"].append(restructure_loss)
-        self.training_step_outputs["dis_loss"].append(discriminator_loss)
-        return total_loss
+        optimizer = self.optimizers()
+        sch = self.lr_schedulers()
+        self.untoggle_optimizer(optimizer)
+        memory, loss = self.share_step(batch)
+        loss = loss/(batch[0].size(0)*batch[0].size(1))
+        self.manual_backward(loss)
+        optimizer.step()
+        sch.step()
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        del pred, ground_truth
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_blue", blue_score)
+        self.training_step_outputs.append((loss, blue_score))
+        return loss
 
     def on_train_epoch_end(self) -> None:
-        metrics = merge_metrics(self.training_step_outputs)
-        self.log("train_gen_loss", metrics[0], prog_bar=True, on_epoch=True)
-        self.log("train_dis_loss", metrics[1], prog_bar=True, on_epoch=True)
-        self.training_step_outputs["gen_loss"] = []
-        self.training_step_outputs["dis_loss"] = []
-
-    def greek_decode(self, input_tensor):
-        output_max_indices = torch.argmax(input_tensor, dim=-1)
-        text = self.tokenizer.batch_decode(output_max_indices)
-        print("{}".format(text[0]))
-        return
+        average_loss, average_blue = self.compute_metrics(self.training_step_outputs)
+        self.log("train_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        self.log("train_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.training_step_outputs = []
 
     def validation_step(self, batch, batch_idx):
-        discriminator_loss, restructure_loss, src_class, \
-            tgt_class, src_label, tgt_label = self.share_step(batch, batch_idx, True)
-        # print("ground truth -> ", src_label)
-        # print("src class    -> ", src_class)
-        # print("tgt  truth   -> ", tgt_label.long())
-        # print("tgt class    -> ", tgt_class)
-        accuracy = compute_accuracy(src_class, src_label)
-        # self.log("val_src_cls_acc", accuracy, prog_bar=True)
-        accuracy = compute_accuracy(tgt_class, tgt_label)
-        # self.log("val_cls_acc", accuracy, prog_bar=True)
-        self.validation_step_outpus["gen_loss"].append(restructure_loss)
-        self.validation_step_outpus["dis_loss"].append(discriminator_loss)
-        # total_loss = src_cls_loss + tgt_cls_loss + restructure_loss
+        memory, loss = self.share_step(batch)
+        loss = loss / (batch[0].size(0) * batch[0].size(1))
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        self.log("val_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("val_blue", blue_score)
+        print(f"original sentence:\t{ground_truth[0]}")
+        print(f"generate sentence:\t{pred[0]}")
+        del pred, ground_truth
+        self.validation_step_outputs.append((loss, blue_score))
 
     def on_validation_epoch_end(self) -> None:
-        metrics = merge_metrics(self.validation_step_outpus)
-        self.log("val_gen_loss", metrics[0], prog_bar=True, on_epoch=True)
-        self.log("val_dis_loss", metrics[1], prog_bar=True, on_epoch=True)
-        self.validation_step_outpus["gen_loss"] = []
-        self.validation_step_outpus["dis_loss"] = []
+        average_loss, average_blue = self.compute_metrics(self.validation_step_outputs)
+        self.log("val_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        self.log("val_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.validation_step_outputs = []
+
+    def test_step(self, batch, batch_idx):
+        memory, loss = self.share_step(batch)
+        loss = loss / (batch.size(0) * batch.size(1))
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        self.log("test_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("test_blue", blue_score)
+        print(f"original sentence:\t{ground_truth[0]}")
+        print(f"generate sentence:\t{pred[0]}")
+        del pred, ground_truth
+        self.test_step_outpus.append((loss, blue_score))
+
+    def on_test_epoch_end(self) -> None:
+        average_loss, average_blue = self.compute_metrics(self.test_step_outputs)
+        self.log("test_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        self.log("test_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.test_step_outputs = []
 
 
     def configure_optimizers(self):
-        opt_g = torch.optim.SGD(self.generator.parameters(), lr=0.1)
-        opt_d = torch.optim.AdamW(self.discriminator.parameters(), lr=0.1, betas=(self.hparams.b1, self.hparams.b2))
-        lr_scheduler_g = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_g, T_0=100, T_mult=2)
-        lr_scheduler_d = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_g, T_0=50, T_mult=2)
-        # lr_scheduler_d = torch.optim.lr_scheduler.OneCycleLR(opt_d, max_lr=0.1, epochs=1000)
-        return [opt_g, opt_d], [lr_scheduler_g, lr_scheduler_d]
+        opt = torch.optim.SGD(self.model.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.lr)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=50, T_mult=2)
+        return [opt], [lr_scheduler]

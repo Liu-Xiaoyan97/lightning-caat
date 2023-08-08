@@ -2,9 +2,10 @@ import argparse
 
 import lightning
 from lightning import Trainer
+from omegaconf import OmegaConf
 
 from modules.datamodules import DataModules
-from modules.lightningmodules import CAATModule
+from modules.lightningmodules import GenerateModule
 
 
 if __name__=="__main__":
@@ -18,14 +19,16 @@ if __name__=="__main__":
     args = parser.parse_args()
     dm = DataModules(file_path_dir=r"./Data/zh", max_len=args.max_len, batch_size=args.batch_size)
     lightning.seed_everything(1)
-    model = CAATModule(max_len=args.max_len, num_layers=args.num_layers)
+    """load config.yml"""
+    config = OmegaConf.load("config.yml")
+    model = GenerateModule(**config, max_len=args.max_len, num_layers=args.num_layers, batch_size=args.batch_size)
     trainer = Trainer(
         callbacks=[
             lightning.pytorch.callbacks.ModelCheckpoint(
-                monitor="val_gen_loss",
+                monitor="val_blue",
                 save_top_k=2,
-                filename='{epoch}-{val_gen_loss:.4f}-{val_dis_loss:.4f}',
-                mode='min'
+                filename='{epoch}-{val_loss:.4f}-{val_blue:.4f}',
+                mode='max'
             )
         ],
         accelerator="auto",
@@ -33,7 +36,7 @@ if __name__=="__main__":
         max_epochs=args.max_epoch,
         # limit_train_batches=0.1,
         # limit_val_batches=0.1,
-        check_val_every_n_epoch=1,
+        check_val_every_n_epoch=5,
         log_every_n_steps=1
     )
     if args.is_train == "Y":

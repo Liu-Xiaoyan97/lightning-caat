@@ -39,16 +39,16 @@ class DataModules(LightningDataModule):
             self.predict_set = ToutiaoDataset
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=16)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False, num_workers=16)
+        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=16)
+        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=4)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.predict_set, batch_size=self.batch_size, shuffle=False, num_workers=16)
+        return DataLoader(self.predict_set, batch_size=self.batch_size, shuffle=False, num_workers=4)
 
 
 class ToutiaoDataset(Dataset):
@@ -79,15 +79,11 @@ class ToutiaoDataset(Dataset):
 
     def convert_str_to_id(self, field):
         text = field["text"]
-        input = self.tokenizer(text, text_target=text, padding=self.padding, truncation=self.truncation,
-                               max_length=self.max_len, add_special_tokens=False)
-        # print(self.tokenizer.sep_token_id)
-        input["labels"].insert(0, self.tokenizer.sep_token_id)
-        input["labels"] = input["labels"][:-1]
-        label_attention_mask = [1]
-        label_attention_mask.extend(input["attention_mask"][: 1])
-        input["tgt_attention_mask"] = label_attention_mask
-        return input
+        output = self.tokenizer(text, text_target=text, padding=self.padding, truncation=self.truncation,
+                               max_length=self.max_len, add_special_tokens=True)
+        output["labels"] = output["labels"][1:]
+        output["labels"].append(self.tokenizer.pad_token_id)
+        return output
 
     def __len__(self):
         return len(self.select_data)
@@ -95,20 +91,18 @@ class ToutiaoDataset(Dataset):
     def __getitem__(self, item):
         field = self.select_data.loc[item]
         field = field.to_dict()
-        label = self.compute_label(field)
         feature = self.convert_str_to_id(field)
         return (
             np.array(feature["input_ids"]),
-            np.array(feature["attention_mask"]),
             np.array(feature["labels"]),
-            np.array(feature["tgt_attention_mask"]),
-            np.array(label)
+            np.array(feature["token_type_ids"]),
+            np.array(feature["attention_mask"])
         )
 
 
-# if __name__ == "__main__":
-#     dm = DataModules(file_path_dir=r"D:\workspace\Work\lightning-caat\Data\zh")
-#     dm.setup("fit")
-#     train_loader = dm.train_dataloader()
-#     for batch, _ in enumerate(train_loader):
-#         print(_)
+if __name__ == "__main__":
+    dm = DataModules(file_path_dir=r"D:\workspace\Work\lightning-caat\Data\zh")
+    dm.setup("fit")
+    train_loader = dm.train_dataloader()
+    for batch, _ in enumerate(train_loader):
+        pass
