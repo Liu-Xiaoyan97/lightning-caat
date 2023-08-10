@@ -46,25 +46,19 @@ class EmbeddingWithPosition(nn.Module):
         return feature_embedding
 
 
-def get_key_padding_mask(tokens, pad_id):
-    key_padding_mask = torch.zeros(tokens.size(), dtype=torch.float)
-    key_padding_mask[tokens.cpu() == pad_id] == (-math.inf)
-    return key_padding_mask.cuda()
-
 
 class BackBoneModule(nn.Module):
-    def __init__(self, vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob, num_mixers):
+    def __init__(self, vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
+                 padding, prob, num_mixers, pad_token_id):
         super().__init__()
         self.dropout = nn.Dropout(p=0.1)
         # n_heads, hidden_dim: int, kernel_size: int, padding: int, prob: float, num_mixers
         self.backbone = MHBAMixer(n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob,  num_mixers)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(embedding_dim),
-            nn.Linear(embedding_dim, vocab_size),
-            nn.LayerNorm(vocab_size),
-            nn.Softmax(dim=-1)
+            nn.Linear(embedding_dim, vocab_size,bias=False),
+            nn.LogSoftmax(dim=-1)
         )
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
 
     @staticmethod
     def greek_decoder(token_logit):
@@ -73,12 +67,12 @@ class BackBoneModule(nn.Module):
 
     def forward(self, inputs, target, padding_mask, causal_mask, embedding):
         feature_embedding = embedding(inputs)
-        last_token_feature = self.backbone(feature_embedding, padding_mask, causal_mask)[:, -1]
-        last_token_logit = self.classifier(last_token_feature)
-        # print(last_token_logit.dtype, )
-        most_prob_idx = self.greek_decoder(last_token_logit)
-        loss = self.criterion(last_token_logit, target.long())
-        return last_token_logit, most_prob_idx, loss
+        token_feature = self.backbone(feature_embedding, padding_mask, causal_mask)
+        token_logit = self.classifier(token_feature)
+        bsz, len_inputs = inputs.size()
+        loss = self.criterion(token_logit.view(bsz*len_inputs, -1), target.view(-1).long())
+        # print(token_feature[0])
+        return token_feature, token_logit, loss
 
 
 class GenerateModule(LightningModule):
@@ -102,9 +96,8 @@ class GenerateModule(LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese')
         self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
         # init generator module
-        self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob, num_layers)
-        # init discriminator
-        self.classification_loss = nn.CrossEntropyLoss()
+        self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
+                                    padding, prob, num_layers)
         self.save_hyperparameters()
         # define temporary variable
         self.training_step_outputs = []
@@ -141,6 +134,7 @@ class GenerateModule(LightningModule):
                 src, target[:, len], attention_mask, self.causal_mask[len][: src.size(1)], self.embedding)
             memory = torch.cat((memory, idx[:, None]), dim=1)
             total_loss += loss
+
         return memory, total_loss
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
@@ -148,7 +142,9 @@ class GenerateModule(LightningModule):
         sch = self.lr_schedulers()
         self.untoggle_optimizer(optimizer)
         memory, loss = self.share_step(batch)
-        loss = loss/(batch[0].size(0)*batch[0].size(1))
+        total_tokens = torch.sum(torch.where(batch[0] != self.tokenizer.pad_token_id, 1, 0))
+        # print(loss, total_tokens)
+        # self.clip_gradients(optimizer, gradient_clip_val=1, gradient_clip_algorithm='value')
         self.manual_backward(loss)
         optimizer.step()
         sch.step()
@@ -170,7 +166,6 @@ class GenerateModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         memory, loss = self.share_step(batch)
-        loss = loss / (batch[0].size(0) * batch[0].size(1))
         pred = self.covert_tokens_to_sentences(memory)
         del memory
         ground_truth = self.covert_tokens_to_sentences(batch[1])
@@ -190,7 +185,8 @@ class GenerateModule(LightningModule):
 
     def test_step(self, batch, batch_idx):
         memory, loss = self.share_step(batch)
-        loss = loss / (batch.size(0) * batch.size(1))
+        total_tokens = torch.sum(torch.where(batch[0] != self.tokenizer.pad_token_id, 1, 0))
+        loss = loss / total_tokens
         pred = self.covert_tokens_to_sentences(memory)
         del memory
         ground_truth = self.covert_tokens_to_sentences(batch[1])
@@ -212,4 +208,144 @@ class GenerateModule(LightningModule):
     def configure_optimizers(self):
         opt = torch.optim.SGD(self.model.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.lr)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=50, T_mult=2)
+        return [opt], [lr_scheduler]
+
+
+class PTMModule(LightningModule):
+    def __init__(self,
+                 vocab_size: int=21128,
+                 embedding_dim: int=64,
+                 n_heads: int=4,
+                 max_len: int=64,
+                 hidden_dim: int=128,
+                 kernel_size = [ 5, 3, 3, 3, 3, 3, 3, 7 ],
+                 padding = [2, 1, 1, 1, 1, 1, 1, 3],
+                 lr: float=0.001,
+                 b1: float=0.999,
+                 b2: float=0.9,
+                 num_layers: int=2,
+                 prob: float=0.8,
+                 batch_size: int=64
+                 ):
+        super().__init__()
+        # define tokenizer convert ids to words
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese')
+        self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
+        # init generator module
+        self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
+                                    padding, prob, num_layers, self.tokenizer.pad_token_id)
+        self.save_hyperparameters()
+        # define temporary variable
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        self.test_step_outpus = []
+        self.automatic_optimization = False
+        self.blue = BLEUScore(smooth=True)
+        self.causal_mask = torch.tril(torch.ones(max_len, max_len), diagonal=0).bool().cuda()
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.kaiming_uniform_(p)
+
+    @staticmethod
+    def compute_metrics(metrics):
+        batch_len = len(metrics)
+        average_loss = 0.
+        average_blue = 0.
+        for iter in metrics:
+            average_loss += iter[0]
+            average_blue += iter[1]
+        return average_loss/batch_len, average_blue/batch_len
+
+    def covert_tokens_to_sentences(self, tokens):
+        sentences = self.tokenizer.batch_decode(tokens.long(), skip_special_tokens=True)
+        return sentences
+
+    @staticmethod
+    def get_attn_pad_mask(query, key, pad_token_id):
+        bsz, len_q, len_k = query.size(0), query.size(1), key.size(1)
+        pad_attn_mask = ~query.data.eq(pad_token_id).unsqueeze(1)
+        return pad_attn_mask.expand(bsz, len_q, len_k)
+
+    def share_step(self, batch):
+        src, target, token_type_ids, attention_mask = batch
+        bsz, len_q, len_k = src.size(0), src.size(1), target.size(1)
+        del attention_mask
+        padding_mask = self.get_attn_pad_mask(src, target, self.tokenizer.pad_token_id)
+        causal_mask = self.causal_mask[:len_q, :len_k].unsqueeze(0).expand(bsz, len_q, len_k)
+        output, logit, loss = self.model(
+                src, target, padding_mask, causal_mask, self.embedding)
+        del padding_mask, causal_mask
+        idx = torch.argmax(logit, dim=-1)
+        return idx, loss
+
+    def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
+        optimizer = self.optimizers()
+        sch = self.lr_schedulers()
+        self.untoggle_optimizer(optimizer)
+        memory, loss = self.share_step(batch)
+        self.clip_gradients(optimizer, gradient_clip_val=1, gradient_clip_algorithm='value')
+        self.manual_backward(loss)
+        optimizer.step()
+        sch.step()
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        del pred, ground_truth
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        # self.log("train_blue", blue_score)
+        self.training_step_outputs.append((loss, blue_score))
+        return loss
+
+    def on_train_epoch_end(self) -> None:
+        average_loss, average_blue = self.compute_metrics(self.training_step_outputs)
+        self.log("train_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        # self.log("train_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.training_step_outputs = []
+
+    def validation_step(self, batch, batch_idx):
+        memory, loss = self.share_step(batch)
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        self.log("val_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        # self.log("val_blue", blue_score)
+        if batch_idx%100 == 0:
+            print(f"original sentence:\t{ground_truth[0]}")
+            print(f"generate sentence:\t{pred[0]}")
+        del pred, ground_truth
+        self.validation_step_outputs.append((loss, blue_score))
+
+    def on_validation_epoch_end(self) -> None:
+        average_loss, average_blue = self.compute_metrics(self.validation_step_outputs)
+        self.log("val_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        # self.log("val_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.validation_step_outputs = []
+
+    def test_step(self, batch, batch_idx):
+        memory, loss = self.share_step(batch)
+        pred = self.covert_tokens_to_sentences(memory)
+        del memory
+        ground_truth = self.covert_tokens_to_sentences(batch[1])
+        blue_score = self.blue(pred, ground_truth)
+        self.log("test_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        # self.log("test_blue", blue_score)
+        if batch_idx % 50 == 0:
+            print(f"\noriginal sentence:\t{ground_truth[0]}")
+            print(f"generate sentence:\t{pred[0]}")
+        del pred, ground_truth
+        self.test_step_outpus.append((loss, blue_score))
+
+    def on_test_epoch_end(self) -> None:
+        average_loss, average_blue = self.compute_metrics(self.test_step_outputs)
+        self.log("test_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
+        # self.log("test_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
+        self.test_step_outputs = []
+
+
+    def configure_optimizers(self):
+        opt = torch.optim.SGD(self.model.parameters(), lr=self.hparams.lr)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=1000, T_mult=1)
         return [opt], [lr_scheduler]

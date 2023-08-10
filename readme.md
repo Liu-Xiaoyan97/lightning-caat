@@ -1,4 +1,7 @@
 # A lightning model for Author Rewriting  
+## UPDATE 2023/8/10  
+version_0.3.1: ```log_softmax``` applied in classifier solve the problem that train loss do not decrease.  
+Let's cheer for ```log_softmax```.
 ## UPDATE 2023/8/8/  
 version_0.3: GPT Style PTM available.  
 In this version, we adopt GPT Style PTM task for text generation which could be represented as follows:  

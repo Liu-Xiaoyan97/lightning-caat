@@ -5,8 +5,7 @@ from lightning import Trainer
 from omegaconf import OmegaConf
 
 from modules.datamodules import DataModules
-from modules.lightningmodules import GenerateModule
-
+from modules.lightningmodules import GenerateModule, PTMModule
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
@@ -21,22 +20,27 @@ if __name__=="__main__":
     lightning.seed_everything(1)
     """load config.yml"""
     config = OmegaConf.load("config.yml")
-    model = GenerateModule(**config, max_len=args.max_len, num_layers=args.num_layers, batch_size=args.batch_size)
+    model = PTMModule(**config, max_len=args.max_len, num_layers=args.num_layers, batch_size=args.batch_size)
     trainer = Trainer(
         callbacks=[
             lightning.pytorch.callbacks.ModelCheckpoint(
-                monitor="val_blue",
+                monitor="val_loss",
                 save_top_k=2,
-                filename='{epoch}-{val_loss:.4f}-{val_blue:.4f}',
-                mode='max'
-            )
+                filename='{epoch}-{val_loss:.6f}-{val_blue:.4f}',
+                mode='min'
+            ),
+            # lightning.pytorch.callbacks.early_stopping(
+            #     monitor="val_loss",
+            #     min_delta=1e-5,
+            #     patience=10,
+            # ),
         ],
         accelerator="auto",
         devices='auto',
         max_epochs=args.max_epoch,
         # limit_train_batches=0.1,
         # limit_val_batches=0.1,
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,
         log_every_n_steps=1
     )
     if args.is_train == "Y":

@@ -39,13 +39,13 @@ class DataModules(LightningDataModule):
             self.predict_set = ToutiaoDataset
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=40)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False)
+        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False, num_workers=40)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=4)
+        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=40)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
         return DataLoader(self.predict_set, batch_size=self.batch_size, shuffle=False, num_workers=4)
