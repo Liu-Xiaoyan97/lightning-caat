@@ -1,10 +1,10 @@
-vocab_size: 21128
-embedding_dim: 512
+vocab_size: 50257
+embedding_dim: 128
 n_heads: 8
-hidden_dim: 768
+hidden_dim: 256
 kernel_size: [ 7, 5, 3, 3, 5, 7, 7, 5, 3, 3, 5, 7, 7 ]
 padding: [3, 2, 1, 1, 2, 3, 3, 2, 1, 1, 2, 3, 3]
-lr: 1e-3
+lr: 5e-4
 b1: 0.999
 b2: 0.9
 prob: 0.8

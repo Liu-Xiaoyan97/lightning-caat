@@ -148,7 +148,7 @@ class MHBAWithMask(nn.Module):
         self.linear = nn.Linear(self.head_dim, self.head_dim)
         self.norm2 = nn.LayerNorm(self.head_dim)
         self.drop = nn.Dropout(0.1)
-        self.activate = nn.ReLU()
+        self.activate = nn.GELU()
 
     @staticmethod
     def keys(inputs, prob):
@@ -191,7 +191,7 @@ class MixerLayer(nn.Module):
         super(MixerLayer, self).__init__(**kwargs)
         self.kernel_size, self.padding = kernel_size, padding
         self.mwm = MHBAWithMask(n_heads, embedding_dim, hidden_dim, prob, [1, kernel_size], [0, padding])
-        self.activate = nn.Tanh()
+        self.activate = nn.GELU()
         self.dropout = nn.Dropout(p=0.5)
         self.ffn = MlpLayer(embedding_dim, hidden_dim)
         self.norm = nn.LayerNorm(embedding_dim)
@@ -212,7 +212,7 @@ class MlpLayer(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, intermediate_dim),
             nn.LayerNorm(intermediate_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(intermediate_dim, hidden_dim),
         ])

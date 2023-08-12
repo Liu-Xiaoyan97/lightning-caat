@@ -1,4 +1,7 @@
 # A lightning model for Author Rewriting  
+## UPDATE 2023/8/11
+version_0.3.2 ```SGD```optimizer applied in training steps.  
+Now, training loss becomes decreasing. 
 ## UPDATE 2023/8/10  
 version_0.3.1: ```log_softmax``` applied in classifier solve the problem that train loss do not decrease.  
 Let's cheer for ```log_softmax```.

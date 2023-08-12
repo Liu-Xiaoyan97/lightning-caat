@@ -69,7 +69,8 @@ class BackBoneModule(nn.Module):
         feature_embedding = embedding(inputs)
         token_feature = self.backbone(feature_embedding, padding_mask, causal_mask)
         token_logit = self.classifier(token_feature)
-        bsz, len_inputs = inputs.size()
+        token_logit = token_logit[..., :-1, :].contiguous()
+        bsz, len_inputs, embed_dim = token_logit.size()
         loss = self.criterion(token_logit.view(bsz*len_inputs, -1), target.view(-1).long())
         # print(token_feature[0])
         return token_feature, token_logit, loss
@@ -93,7 +94,7 @@ class GenerateModule(LightningModule):
                  ):
         super().__init__()
         # define tokenizer convert ids to words
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese')
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2-xl')
         self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
         # init generator module
         self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
@@ -229,7 +230,8 @@ class PTMModule(LightningModule):
                  ):
         super().__init__()
         # define tokenizer convert ids to words
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese')
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2-xl')
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
         # init generator module
         self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
@@ -268,10 +270,10 @@ class PTMModule(LightningModule):
         return pad_attn_mask.expand(bsz, len_q, len_k)
 
     def share_step(self, batch):
-        src, target, token_type_ids, attention_mask = batch
-        bsz, len_q, len_k = src.size(0), src.size(1), target.size(1)
+        src, target, attention_mask = batch
+        bsz, len_q, len_k = src.size(0), src.size(1), src.size(1)
         del attention_mask
-        padding_mask = self.get_attn_pad_mask(src, target, self.tokenizer.pad_token_id)
+        padding_mask = self.get_attn_pad_mask(src, src, self.tokenizer.pad_token_id)
         causal_mask = self.causal_mask[:len_q, :len_k].unsqueeze(0).expand(bsz, len_q, len_k)
         output, logit, loss = self.model(
                 src, target, padding_mask, causal_mask, self.embedding)

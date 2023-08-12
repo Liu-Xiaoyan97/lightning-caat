@@ -15,12 +15,14 @@ import torch
 from pytorch_lightning import LightningDataModule
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch.utils.data import DataLoader, Dataset
-import torchdata.datapipes as dp
-from torchdata.datapipes.iter import JsonParser, IterDataPipe, CSVParser
 from typing import List, Optional, Dict
 from transformers import PreTrainedTokenizer, AutoTokenizer
-from tqdm import tqdm
-
+import platform
+num_workers = 0
+if platform.system() == "Linux":
+    num_workers = 40
+else:
+    num_workers = 1
 
 class DataModules(LightningDataModule):
     def __init__(self, file_path_dir: str, batch_size: int=32, max_len: int=32):
@@ -39,13 +41,13 @@ class DataModules(LightningDataModule):
             self.predict_set = ToutiaoDataset
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=40)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False, num_workers=40)
+        return DataLoader(self.eval_set, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=40)
+        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
         return DataLoader(self.predict_set, batch_size=self.batch_size, shuffle=False, num_workers=4)
@@ -66,7 +68,9 @@ class ToutiaoDataset(Dataset):
             self.select_data = pd.concat([self.select_data, tmp])
         self.select_data = self.select_data.reset_index(drop=True)
         del self.data
-        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-chinese")
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2-xl')
+        # print(self.tokenizer.pad_token_id)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         if label_map is None:
             keys = [str(i) for i in range(100, 117)]
             values = range(0, 17)
@@ -79,10 +83,9 @@ class ToutiaoDataset(Dataset):
 
     def convert_str_to_id(self, field):
         text = field["text"]
-        output = self.tokenizer(text, text_target=text, padding=self.padding, truncation=self.truncation,
+        output = self.tokenizer(text, text_target=text, padding='max_length', truncation=self.truncation,
                                max_length=self.max_len, add_special_tokens=True)
         output["labels"] = output["labels"][1:]
-        output["labels"].append(self.tokenizer.pad_token_id)
         return output
 
     def __len__(self):
@@ -92,10 +95,10 @@ class ToutiaoDataset(Dataset):
         field = self.select_data.loc[item]
         field = field.to_dict()
         feature = self.convert_str_to_id(field)
+        # print(feature)
         return (
             np.array(feature["input_ids"]),
             np.array(feature["labels"]),
-            np.array(feature["token_type_ids"]),
             np.array(feature["attention_mask"])
         )
 
