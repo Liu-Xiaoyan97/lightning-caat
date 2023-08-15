@@ -1,4 +1,6 @@
-# A lightning model for Author Rewriting  
+# A lightning model for Author Rewriting
+## UPDATE 2023/8/15
+version_0.3.3 Streaming I/O supporting.
 ## UPDATE 2023/8/11
 version_0.3.2 ```SGD```optimizer applied in training steps.  
 Now, training loss becomes decreasing. 

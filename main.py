@@ -4,7 +4,7 @@ import lightning
 from lightning import Trainer
 from omegaconf import OmegaConf
 
-from modules.datamodules import DataModules
+from modules.datamodules import DataModules, PTMDataModules
 from modules.lightningmodules import GenerateModule, PTMModule
 
 if __name__=="__main__":
@@ -16,7 +16,7 @@ if __name__=="__main__":
     parser.add_argument('--ckpt', type=str, default=None)
     parser.add_argument('--is_train', type=str, default='Y')
     args = parser.parse_args()
-    dm = DataModules(file_path_dir=r"./Data/zh", max_len=args.max_len, batch_size=args.batch_size)
+    dm = PTMDataModules(file_path_dir=r"d://workspace//Work//merge_corpus_csv", max_len=32, batch_size=args.batch_size)
     lightning.seed_everything(1)
     """load config.yml"""
     config = OmegaConf.load("config.yml")
@@ -26,7 +26,7 @@ if __name__=="__main__":
             lightning.pytorch.callbacks.ModelCheckpoint(
                 monitor="val_loss",
                 save_top_k=2,
-                filename='{epoch}-{val_loss:.6f}-{val_blue:.4f}',
+                filename='{epoch}-{val_loss:.6f}',
                 mode='min'
             ),
             # lightning.pytorch.callbacks.early_stopping(

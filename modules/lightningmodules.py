@@ -14,6 +14,8 @@ from torch import nn, Tensor
 from torchmetrics import BLEUScore
 from transformers import AutoTokenizer
 from modules.MHBAMixer import MHBAMixer
+from utils import softmax_temperature
+from transformers import top_k_top_p_filtering
 
 
 class PositionalEncoding(nn.Module):
@@ -56,7 +58,6 @@ class BackBoneModule(nn.Module):
         self.backbone = MHBAMixer(n_heads, embedding_dim, hidden_dim, kernel_size, padding, prob,  num_mixers)
         self.classifier = nn.Sequential(
             nn.Linear(embedding_dim, vocab_size,bias=False),
-            nn.LogSoftmax(dim=-1)
         )
         self.criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
 
@@ -65,12 +66,15 @@ class BackBoneModule(nn.Module):
         token_idx = torch.argmax(token_logit, dim=-1)
         return token_idx
 
-    def forward(self, inputs, target, padding_mask, causal_mask, embedding):
+    def forward(self, inputs, target, padding_mask, causal_mask, embedding, temperature):
         feature_embedding = embedding(inputs)
         token_feature = self.backbone(feature_embedding, padding_mask, causal_mask)
-        token_logit = self.classifier(token_feature)
+        token_logit = softmax_temperature(self.classifier(token_feature), temperature, dim=-1)
+        # [B L V]
         token_logit = token_logit[..., :-1, :].contiguous()
-        bsz, len_inputs, embed_dim = token_logit.size()
+        bsz, len_inputs, vocab_len = token_logit.size()
+        # subset_vocab = top_k_top_p_filtering(token_logit, top_k=top_k, top_p=top_p)
+        # print(subset_vocab.shape)
         loss = self.criterion(token_logit.view(bsz*len_inputs, -1), target.view(-1).long())
         # print(token_feature[0])
         return token_feature, token_logit, loss
@@ -90,7 +94,8 @@ class GenerateModule(LightningModule):
                  b2: float=0.9,
                  num_layers: int=2,
                  prob: float=0.8,
-                 batch_size: int=64
+                 batch_size: int=64,
+                 temperature: float=0.1
                  ):
         super().__init__()
         # define tokenizer convert ids to words
@@ -132,7 +137,8 @@ class GenerateModule(LightningModule):
         total_loss = 0.
         for len in range(self.hparams.max_len):
             output, idx, loss = self.model(
-                src, target[:, len], attention_mask, self.causal_mask[len][: src.size(1)], self.embedding)
+                src, target[:, len], attention_mask, self.causal_mask[len][: src.size(1)],
+                self.embedding, self.hparams.temperature)
             memory = torch.cat((memory, idx[:, None]), dim=1)
             total_loss += loss
 
@@ -226,7 +232,8 @@ class PTMModule(LightningModule):
                  b2: float=0.9,
                  num_layers: int=2,
                  prob: float=0.8,
-                 batch_size: int=64
+                 batch_size: int=64,
+                 temperature: float=0.1
                  ):
         super().__init__()
         # define tokenizer convert ids to words
@@ -235,14 +242,15 @@ class PTMModule(LightningModule):
         self.embedding = EmbeddingWithPosition(vocab_size, embedding_dim, max_len, batch_size)
         # init generator module
         self.model = BackBoneModule(vocab_size, n_heads, embedding_dim, hidden_dim, kernel_size,
-                                    padding, prob, num_layers, self.tokenizer.pad_token_id)
+                                    padding, prob, num_layers, self.tokenizer.pad_token_id
+                                    )
         self.save_hyperparameters()
         # define temporary variable
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.test_step_outpus = []
         self.automatic_optimization = False
-        self.blue = BLEUScore(smooth=True)
+        # self.blue = BLEUScore(smooth=True)
         self.causal_mask = torch.tril(torch.ones(max_len, max_len), diagonal=0).bool().cuda()
 
         for p in self.parameters():
@@ -253,11 +261,9 @@ class PTMModule(LightningModule):
     def compute_metrics(metrics):
         batch_len = len(metrics)
         average_loss = 0.
-        average_blue = 0.
         for iter in metrics:
-            average_loss += iter[0]
-            average_blue += iter[1]
-        return average_loss/batch_len, average_blue/batch_len
+            average_loss += iter
+        return average_loss/batch_len
 
     def covert_tokens_to_sentences(self, tokens):
         sentences = self.tokenizer.batch_decode(tokens.long(), skip_special_tokens=True)
@@ -276,7 +282,8 @@ class PTMModule(LightningModule):
         padding_mask = self.get_attn_pad_mask(src, src, self.tokenizer.pad_token_id)
         causal_mask = self.causal_mask[:len_q, :len_k].unsqueeze(0).expand(bsz, len_q, len_k)
         output, logit, loss = self.model(
-                src, target, padding_mask, causal_mask, self.embedding)
+                src, target, padding_mask, causal_mask, self.embedding, self.hparams.temperature)
+
         del padding_mask, causal_mask
         idx = torch.argmax(logit, dim=-1)
         return idx, loss
@@ -290,20 +297,14 @@ class PTMModule(LightningModule):
         self.manual_backward(loss)
         optimizer.step()
         sch.step()
-        pred = self.covert_tokens_to_sentences(memory)
         del memory
-        ground_truth = self.covert_tokens_to_sentences(batch[1])
-        blue_score = self.blue(pred, ground_truth)
-        del pred, ground_truth
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        # self.log("train_blue", blue_score)
-        self.training_step_outputs.append((loss, blue_score))
+        self.training_step_outputs.append(loss)
         return loss
 
     def on_train_epoch_end(self) -> None:
-        average_loss, average_blue = self.compute_metrics(self.training_step_outputs)
+        average_loss = self.compute_metrics(self.training_step_outputs)
         self.log("train_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
-        # self.log("train_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
         self.training_step_outputs = []
 
     def validation_step(self, batch, batch_idx):
@@ -311,19 +312,16 @@ class PTMModule(LightningModule):
         pred = self.covert_tokens_to_sentences(memory)
         del memory
         ground_truth = self.covert_tokens_to_sentences(batch[1])
-        blue_score = self.blue(pred, ground_truth)
         self.log("val_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        # self.log("val_blue", blue_score)
         if batch_idx%100 == 0:
             print(f"original sentence:\t{ground_truth[0]}")
             print(f"generate sentence:\t{pred[0]}")
         del pred, ground_truth
-        self.validation_step_outputs.append((loss, blue_score))
+        self.validation_step_outputs.append(loss)
 
     def on_validation_epoch_end(self) -> None:
-        average_loss, average_blue = self.compute_metrics(self.validation_step_outputs)
+        average_loss = self.compute_metrics(self.validation_step_outputs)
         self.log("val_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
-        # self.log("val_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
         self.validation_step_outputs = []
 
     def test_step(self, batch, batch_idx):
@@ -331,23 +329,20 @@ class PTMModule(LightningModule):
         pred = self.covert_tokens_to_sentences(memory)
         del memory
         ground_truth = self.covert_tokens_to_sentences(batch[1])
-        blue_score = self.blue(pred, ground_truth)
         self.log("test_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        # self.log("test_blue", blue_score)
         if batch_idx % 50 == 0:
             print(f"\noriginal sentence:\t{ground_truth[0]}")
             print(f"generate sentence:\t{pred[0]}")
         del pred, ground_truth
-        self.test_step_outpus.append((loss, blue_score))
+        self.test_step_outpus.append(loss)
 
     def on_test_epoch_end(self) -> None:
-        average_loss, average_blue = self.compute_metrics(self.test_step_outputs)
+        average_loss = self.compute_metrics(self.test_step_outputs)
         self.log("test_loss_epoch", average_loss, prog_bar=True, on_epoch=True)
-        # self.log("test_blue_epoch", average_blue, prog_bar=True, on_epoch=True)
         self.test_step_outputs = []
 
 
     def configure_optimizers(self):
-        opt = torch.optim.SGD(self.model.parameters(), lr=self.hparams.lr)
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=1000, T_mult=1)
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=2000, T_mult=1)
         return [opt], [lr_scheduler]

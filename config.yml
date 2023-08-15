@@ -4,7 +4,8 @@ n_heads: 8
 hidden_dim: 256
 kernel_size: [ 7, 5, 3, 3, 5, 7, 7, 5, 3, 3, 5, 7, 7 ]
 padding: [3, 2, 1, 1, 2, 3, 3, 2, 1, 1, 2, 3, 3]
-lr: 5e-4
+lr: 2.5e-3
 b1: 0.999
 b2: 0.9
 prob: 0.8
+temperature: 0.1
